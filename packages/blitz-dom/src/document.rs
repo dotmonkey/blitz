@@ -25,6 +25,7 @@ use cursor_icon::CursorIcon;
 use linebender_resource_handle::Blob;
 use markup5ever::local_name;
 use parley::{FontContext, PlainEditorDriver};
+use parley::fontique::FontInfoOverride;
 use selectors::{Element, matching::QuirksMode};
 use slab::Slab;
 use std::any::Any;
@@ -1005,15 +1006,18 @@ impl BaseDocument {
                     }
                 }
             }
-            Resource::Font(bytes) => {
+            Resource::Font(bytes, metadata) => {
                 let font = Blob::new(Arc::new(bytes));
+                let info_override = FontInfoOverride {
+                    family_name: metadata.family_name.as_deref(),
+                    ..Default::default()
+                };
 
-                // TODO: Implement FontInfoOveride
                 // TODO: Investigate eliminating double-box
                 let mut global_font_ctx = self.font_ctx.lock().unwrap();
                 global_font_ctx
                     .collection
-                    .register_fonts(font.clone(), None);
+                    .register_fonts(font.clone(), Some(info_override));
 
                 #[cfg(feature = "parallel-construct")]
                 {
@@ -1022,7 +1026,9 @@ impl BaseDocument {
                             .thread_font_contexts
                             .get_or(|| RefCell::new(Box::new(global_font_ctx.clone())))
                             .borrow_mut();
-                        font_ctx.collection.register_fonts(font.clone(), None);
+                        font_ctx
+                            .collection
+                            .register_fonts(font.clone(), Some(info_override));
                     });
                 }
                 drop(global_font_ctx);

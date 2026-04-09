@@ -20,10 +20,16 @@ use style::{
 
 use blitz_traits::net::{Bytes, NetHandler, NetProvider, Request};
 use blitz_traits::shell::ShellProvider;
+use style_traits::ToCss;
 
 use url::Url;
 
 use crate::{document::DocumentEvent, util::ImageType};
+
+#[derive(Clone, Debug, Default)]
+pub struct FontResourceMetadata {
+    pub family_name: Option<String>,
+}
 
 #[derive(Clone, Debug)]
 pub enum Resource {
@@ -31,7 +37,7 @@ pub enum Resource {
     #[cfg(feature = "svg")]
     Svg(ImageType, Arc<usvg::Tree>),
     Css(DocumentStyleSheet),
-    Font(Bytes),
+    Font(Bytes, FontResourceMetadata),
     None,
 }
 
@@ -248,7 +254,10 @@ impl NetHandler for ResourceHandler<NestedStylesheetHandler> {
     }
 }
 
-struct FontFaceHandler(FontFaceSourceFormatKeyword);
+struct FontFaceHandler {
+    format: FontFaceSourceFormatKeyword,
+    metadata: FontResourceMetadata,
+}
 impl NetHandler for ResourceHandler<FontFaceHandler> {
     fn bytes(mut self: Box<Self>, resolved_url: String, bytes: Bytes) {
         let result = self.data.parse(bytes);
@@ -257,8 +266,8 @@ impl NetHandler for ResourceHandler<FontFaceHandler> {
 }
 impl FontFaceHandler {
     fn parse(&mut self, bytes: Bytes) -> Result<Resource, String> {
-        if self.0 == FontFaceSourceFormatKeyword::None && bytes.len() >= 4 {
-            self.0 = match &bytes.as_ref()[0..4] {
+        if self.format == FontFaceSourceFormatKeyword::None && bytes.len() >= 4 {
+            self.format = match &bytes.as_ref()[0..4] {
                 // WOFF (v1) files begin with 0x774F4646 ('wOFF' in ascii)
                 // See: <https://w3c.github.io/woff/woff1/spec/Overview.html#WOFFHeader>
                 #[cfg(feature = "woff")]
@@ -284,7 +293,7 @@ impl FontFaceHandler {
         #[cfg(feature = "woff")]
         let mut bytes = bytes;
 
-        match self.0 {
+        match self.format {
             #[cfg(feature = "woff")]
             FontFaceSourceFormatKeyword::Woff => {
                 #[cfg(feature = "tracing")]
@@ -322,7 +331,7 @@ impl FontFaceHandler {
             _ => {}
         }
 
-        Ok(Resource::Font(bytes))
+        Ok(Resource::Font(bytes, self.metadata.clone()))
     }
 }
 
@@ -341,16 +350,15 @@ pub(crate) fn fetch_font_face(
         .iter()
         .filter_map(|rule| match rule {
             CssRule::FontFace(font_face) => {
-                // Return source list if both source list and font_family are present
-                let descriptor = &font_face.read_with(read_guard).descriptors;
-                descriptor
-                    .src
-                    .as_ref()
-                    .filter(|_| descriptor.font_family.is_some())
+                let font_face = font_face.read_with(read_guard);
+                let descriptors = &font_face.descriptors;
+                let sources = descriptors.src.as_ref()?;
+                let family_name = descriptors.font_family.as_ref().map(ToCss::to_css_string);
+                Some((sources, FontResourceMetadata { family_name }))
             }
             _ => None,
         })
-        .for_each(|source_list| {
+        .for_each(|(source_list, metadata)| {
             // Find the first font source in the source list that specifies a font of a type
             // that we support.
             let preferred_source = source_list
@@ -363,7 +371,7 @@ pub(crate) fn fetch_font_face(
                 })
                 .find_map(|url_source| {
                     let mut format = match &url_source.format_hint {
-                        Some(FontFaceSourceFormat::Keyword(fmt)) => *fmt,
+                        Some(FontFaceSourceFormat::Keyword(fmt)) => fmt.clone(),
                         Some(FontFaceSourceFormat::String(str)) => match str.as_str() {
                             "woff2" => FontFaceSourceFormatKeyword::Woff2,
                             "ttf" => FontFaceSourceFormatKeyword::Truetype,
@@ -418,7 +426,7 @@ pub(crate) fn fetch_font_face(
                         doc_id,
                         node_id,
                         shell_provider.clone(),
-                        FontFaceHandler(format),
+                        FontFaceHandler { format, metadata },
                     ),
                 );
             }
