@@ -90,6 +90,25 @@ jobs:
           version: 1.0
       - run: cargo build -p counter
 
+  # wasm_hello is a standalone workspace; seven_guis and todomvc are workspace
+  # members with a [lib] crate-type = ["cdylib"] target for wasm.
+  build-wasm-examples:
+    name: "Build wasm examples"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+          targets: wasm32-unknown-unknown
+      - name: Build wasm_hello
+        run: cargo build --target wasm32-unknown-unknown
+        working-directory: examples/wasm_hello
+      - name: Build seven_guis (wasm)
+        run: cargo build -p seven_guis --lib --target wasm32-unknown-unknown --no-default-features --features hybrid
+      - name: Build todomvc (wasm)
+        run: cargo build -p todomvc --lib --target wasm32-unknown-unknown --no-default-features --features hybrid
+
   fmt:
     name: Rustfmt
     runs-on: ubuntu-latest

@@ -18,48 +18,35 @@ use winit::platform::macos::WindowAttributesMacOS;
 
 pub(crate) type StdNetProvider = blitz_net::Provider;
 
+mod about_pages;
+mod browser_history;
 #[cfg(any(feature = "screenshot", feature = "capture"))]
 mod capture;
 mod document_loader;
+mod favicon;
 #[cfg(feature = "vello")]
 mod fps_overlay;
 mod history;
 mod icons;
+mod nav;
 mod status_bar;
 mod tab;
 mod tab_strip;
 mod toolbar;
+mod url_suggestions;
 
-use history::HistoryNav;
+use about_pages::AboutPage;
+use browser_history::{BrowsingHistory, HistoryService, HistoryStore, MAX_HISTORY_ENTRIES};
 use status_bar::StatusBar;
-use tab::{Tab, TabId, active_tab, tab_title_or_url};
+use tab::{Tab, TabId, TabStoreImplExt, TabWebView, active_tab, open_tab, tab_display_title};
 use tab_strip::TabStrip;
 use toolbar::Toolbar;
-
-#[component]
-fn TabView(tab: Tab, is_active: bool) -> Element {
-    use_effect(move || {
-        let request = (*tab.history.current_url().read()).clone();
-        tab.loader.load_document(request);
-    });
-
-    let mut tab_node_handle = tab.node_handle;
-    rsx!(
-        web-view {
-            class: "webview",
-            style: if is_active { "display: block" } else { "display: none" },
-            "__webview_document": tab.document.cloned(),
-            onmounted: move |evt: Event<MountedData>| {
-                let node_handle = evt.downcast::<NodeHandle>().unwrap();
-                *tab_node_handle.write() = Some(node_handle.clone());
-            },
-        }
-    )
-}
+use url_suggestions::provide_url_suggester;
+#[cfg(target_os = "windows")]
+use winit::platform::windows::WinIcon;
 
 static BROWSER_UI_STYLES: Asset = asset!("../assets/browser.css");
 pub(crate) const IS_MOBILE: bool = cfg!(any(target_os = "android", target_os = "ios"));
-pub(crate) const HOME_URL_STR: &str = "about:newtab";
 
 #[unsafe(no_mangle)]
 #[cfg(target_os = "android")]
@@ -72,6 +59,9 @@ fn main() {
     #[cfg(feature = "tracing")]
     tracing_subscriber::fmt::init();
     let window_attributes = WindowAttributes::default();
+    #[cfg(target_os = "windows")]
+    let window_attributes = window_attributes
+        .with_window_icon(WinIcon::from_resource(32512, None).map(Into::into).ok());
     #[cfg(target_os = "macos")]
     let window_attributes = window_attributes.with_platform_attributes(Box::new(
         WindowAttributesMacOS::default()
@@ -85,22 +75,38 @@ fn main() {
 }
 
 fn app() -> Element {
-    let home_url = use_hook(|| Url::parse(HOME_URL_STR).unwrap());
+    let home_url = use_hook(|| AboutPage::NewTab.parsed_url());
     let net_provider = use_context::<Arc<StdNetProvider>>();
 
     let url_input_handle: Signal<Option<NodeHandle>> = use_signal(|| None);
     let url_input_value = use_signal(|| home_url.to_string());
 
-    let mut tabs: Signal<Vec<Tab>> =
-        use_hook(|| Signal::new(vec![Tab::new(home_url.clone(), net_provider.clone())]));
-    let mut active_tab_id: Signal<TabId> =
-        use_hook(|| Signal::new(tabs.read().first().map(|t| t.id).unwrap_or(0)));
+    let history_store: HistoryStore = use_hook(HistoryStore::open);
+
+    // Synchronous on purpose: the toolbar's URL suggestions read from this
+    // store on first render, so the entries need to be present before the
+    // tree mounts. The read is a single sqlite query capped at
+    // MAX_HISTORY_ENTRIES rows and runs once per process.
+    let browsing_history: Store<BrowsingHistory> = {
+        let history_store = history_store.clone();
+        use_store(move || {
+            BrowsingHistory::from_entries(history_store.load_recent(MAX_HISTORY_ENTRIES))
+        })
+    };
+
+    let history_service = HistoryService::new(browsing_history, history_store);
+    use_context_provider(|| history_service.clone());
+    provide_url_suggester(browsing_history);
+
+    let tabs: Store<Vec<Tab>> = use_store(Vec::new);
+    let mut active_tab_id: Signal<TabId> = use_hook(|| {
+        let tab = open_tab(tabs, home_url.clone(), net_provider.clone());
+        Signal::new(tab.tab_id())
+    });
 
     let open_new_tab = use_callback(move |url: Url| {
-        let new_tab = Tab::new(url, net_provider.clone());
-        let new_id = new_tab.id;
-        tabs.write().push(new_tab);
-        active_tab_id.set(new_id);
+        let new_id = open_tab(tabs, url, net_provider.clone());
+        active_tab_id.set(new_id.tab_id());
         if let Some(handle) = url_input_handle() {
             drop(handle.set_focus(true));
         }
@@ -128,7 +134,7 @@ fn app() -> Element {
     #[cfg(not(feature = "vello"))]
     let fps_overlay_el = rsx!();
 
-    let window_title = tab_title_or_url(&active_tab(&tabs, active_tab_id()));
+    let window_title = tab_display_title(active_tab(tabs, active_tab_id()));
 
     rsx!(
         div {
@@ -141,7 +147,7 @@ fn app() -> Element {
             TabStrip {
                 tabs,
                 active_tab_id,
-                home_url: home_url.clone(),
+                home_url,
                 open_new_tab,
             }
             Toolbar {
@@ -149,15 +155,14 @@ fn app() -> Element {
                 url_input_value,
                 tabs,
                 active_tab_id,
+                open_new_tab,
                 show_fps,
             }
-            for tab in tabs() {
-                {
-                    let id = tab.id;
-                    let is_active = id == active_tab_id();
-                    rsx!(
-                        TabView { key: "{id}", tab, is_active }
-                    )
+            for tab in tabs.iter() {
+                TabWebView {
+                    key: "{tab.tab_id()}",
+                    tab,
+                    active_tab_id,
                 }
             }
             {fps_overlay_el}

@@ -38,7 +38,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex, MutexGuard, RwLockReadGuard, RwLockWriteGuard};
 use std::task::Context as TaskContext;
-use std::time::Instant;
 use style::Atom;
 use style::animation::DocumentAnimationSet;
 use style::attr::{AttrIdentifier, AttrValue};
@@ -50,7 +49,7 @@ use style::queries::values::PrefersColorScheme;
 use style::selector_parser::ServoElementSnapshot;
 use style::servo_arc::Arc as ServoArc;
 use style::values::GenericAtomIdent;
-use style::values::computed::Overflow;
+use style::values::computed::{Overflow, UserSelect};
 use style::{
     device::Device,
     dom::{TDocument, TNode},
@@ -61,6 +60,7 @@ use style::{
     stylist::Stylist,
 };
 use url::Url;
+use web_time::Instant;
 
 #[cfg(feature = "parallel-construct")]
 use thread_local::ThreadLocal;
@@ -269,6 +269,13 @@ pub struct BaseDocument {
     /// Set of changed nodes for updating the accessibility tree
     pub(crate) deferred_construction_nodes: Vec<ConstructionTask>,
 
+    /// Nodes that contain custom widgets
+    #[cfg(feature = "custom-widget")]
+    pub(crate) custom_widget_nodes: HashSet<usize>,
+    /// Rendering resources allocated by custom widgets that should be deallocated during the next render
+    #[cfg(feature = "custom-widget")]
+    pub(crate) pending_resource_deallocations: Vec<anyrender::ResourceId>,
+
     /// Cache of loaded images, keyed by URL. Allows reusing images across multiple
     /// elements without re-fetching from the network.
     pub(crate) image_cache: HashMap<String, ImageData>,
@@ -414,6 +421,12 @@ impl BaseDocument {
             subdoc_is_animating: false,
             has_canvas: false,
             sub_document_nodes: HashSet::new(),
+
+            #[cfg(feature = "custom-widget")]
+            custom_widget_nodes: HashSet::new(),
+            #[cfg(feature = "custom-widget")]
+            pending_resource_deallocations: Vec::new(),
+
             changed_nodes: HashSet::new(),
             deferred_construction_nodes: Vec::new(),
             image_cache: HashMap::new(),
@@ -497,6 +510,23 @@ impl BaseDocument {
 
     pub fn id(&self) -> usize {
         self.id
+    }
+
+    pub fn favicon_url(&self) -> Option<String> {
+        self.tree().iter().find_map(|(_, node)| {
+            let data = &node.data;
+            if !data.is_element_with_tag_name(&local_name!("link")) {
+                return None;
+            }
+            let rel = data.attr(local_name!("rel"))?;
+            if !rel
+                .split_ascii_whitespace()
+                .any(|v| v.eq_ignore_ascii_case("icon"))
+            {
+                return None;
+            }
+            data.attr(local_name!("href")).map(|s| s.to_string())
+        })
     }
 
     pub fn get_node(&self, node_id: usize) -> Option<&Node> {
@@ -616,6 +646,10 @@ impl BaseDocument {
         }
     }
 
+    pub fn sub_document_node_ids(&self) -> Vec<usize> {
+        self.sub_document_nodes.iter().copied().collect()
+    }
+
     pub fn set_sub_document(&mut self, node_id: usize, sub_document: Box<dyn Document>) {
         self.nodes[node_id]
             .element_data_mut()
@@ -630,6 +664,36 @@ impl BaseDocument {
             .unwrap()
             .remove_sub_document();
         self.sub_document_nodes.remove(&node_id);
+    }
+
+    #[cfg(feature = "custom-widget")]
+    pub fn custom_widget_node_ids(&self) -> Vec<usize> {
+        self.custom_widget_nodes.iter().copied().collect()
+    }
+
+    #[cfg(feature = "custom-widget")]
+    pub fn take_pending_resource_deallocations(&mut self) -> Vec<anyrender::ResourceId> {
+        std::mem::take(&mut self.pending_resource_deallocations)
+    }
+
+    #[cfg(feature = "custom-widget")]
+    pub fn set_custom_widget(&mut self, node_id: usize, widget: Box<dyn crate::Widget>) {
+        self.nodes[node_id]
+            .element_data_mut()
+            .unwrap()
+            .set_custom_widget(widget);
+        self.custom_widget_nodes.insert(node_id);
+    }
+
+    #[cfg(feature = "custom-widget")]
+    pub fn remove_custom_widget(&mut self, node_id: usize) {
+        let resources_to_deallocate = self.nodes[node_id]
+            .element_data_mut()
+            .unwrap()
+            .remove_custom_widget();
+        self.pending_resource_deallocations
+            .extend_from_slice(&resources_to_deallocate);
+        self.custom_widget_nodes.remove(&node_id);
     }
 
     pub fn root_node(&self) -> &Node {
@@ -1330,9 +1394,15 @@ impl BaseDocument {
     }
 
     pub fn is_animating(&self) -> bool {
+        #[cfg(feature = "custom-widget")]
+        let has_custom_widgets = !self.custom_widget_nodes.is_empty();
+        #[cfg(not(feature = "custom-widget"))]
+        let has_custom_widgets = false;
+
         self.has_canvas
             | self.has_active_animations
             | self.subdoc_is_animating
+            | has_custom_widgets
             | (self.scroll_animation != ScrollAnimationState::None)
     }
 
@@ -1361,11 +1431,12 @@ impl BaseDocument {
         }
 
         let style = node.primary_styles()?;
+        let user_select = style.clone_user_select();
         let keyword = stylo_to_cursor_icon(style.clone_cursor().keyword);
 
         // Return cursor from style if it is non-auto
-        if keyword != CursorIcon::Default {
-            return Some(keyword);
+        if let Some(cursor) = keyword {
+            return Some(cursor);
         }
 
         // Return text cursor for text inputs
@@ -1388,7 +1459,10 @@ impl BaseDocument {
 
         // Return text cursor for text nodes
         if self.hover_node_is_text {
-            return Some(CursorIcon::Text);
+            return Some(match user_select {
+                UserSelect::Text => CursorIcon::Text,
+                _ => CursorIcon::Default,
+            });
         }
 
         // Else fallback to default cursor

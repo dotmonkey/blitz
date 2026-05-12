@@ -71,6 +71,9 @@ pub mod util;
 #[cfg(feature = "accessibility")]
 mod accessibility;
 
+#[cfg(feature = "custom-widget")]
+pub use crate::node::Widget;
+
 pub use config::DocumentConfig;
 pub use document::{BaseDocument, DocGuard, DocGuardMut, Document, PlainDocument};
 pub use markup5ever::{
@@ -86,4 +89,4 @@ pub use style::media_queries::MediaType;
 pub type SelectorList = selectors::SelectorList<style::selector_parser::SelectorImpl>;
 pub use events::{EventDriver, EventHandler, NoopEventHandler};
 pub use html::{DummyHtmlParserProvider, HtmlParserProvider};
-pub use util::Point;
+pub use util::{Point, decode_font_bytes};
